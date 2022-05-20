@@ -5,10 +5,10 @@ on:
     inputs:
       TF_action:
         description: Test Input
-        required: false
+        required: true
       Environment:
         description: Environment
-        required: false
+        required: true
 
 jobs:
   deploy:
@@ -22,4 +22,4 @@ jobs:
     steps:
       - name: Test Pipeline
         run: |
-          echo "This is a test pipeline"
+          echo "This is a test pipeline with inputs: ${{ github.event.inputs.TF_action }} and ${{ github.event.inputs.Environment }}"
