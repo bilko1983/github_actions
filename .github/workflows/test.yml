@@ -6,6 +6,9 @@ on:
       TF_action:
         description: Test Input
         required: false
+      Environment:
+        description: Environment
+        required: false
 
 jobs:
   deploy:
