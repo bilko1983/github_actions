@@ -1,0 +1,135 @@
+name: dev env db refresh
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      Environment:
+        description: 'Environment you wish to refresh. Please enusure you use this workflow only for envs dev1 to dev11'
+        required: true
+jobs:
+  set-up:
+    name: Set Up
+    runs-on: [self-hosted, db-refresh]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+  checking-environment:
+    name: Checking Environment input is valid
+    runs-on: [ self-hosted, db-refresh ]
+    needs: set-up
+    steps:
+      - name: Checking Environment input is valid
+        run: |
+          envs=(dev1 dev2 dev3 dev4 dev5 dev6 dev7 dev8 dev9 dev10 dev11)
+          if [[ ! " ${envs[*]} " =~ " ${{ github.event.inputs.Environment }} " ]]; then
+            echo "Please input one of the following dev environments dev1, dev2, dev3, dev4, dev5, dev6, dev7, dev8, dev9, dev10 or dev11"
+            exit 1
+          else
+            echo "Environment input is valid"
+          fi
+
+  creating-test-cluster:
+    name: Creating Test RDS Cluster
+    runs-on: [self-hosted, db-refresh]
+    needs: [ set-up, checking-environment ]
+    steps:
+      - name: Configure AWS credentials for TEST
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_BILLING_JENKINS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_BILLING_JENKINS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-to-assume: "arn:aws:iam::${{ secrets.AWS_TEST_ACCOUNT_NUMBER }}:role/${{secrets.AWS_PLATFORMS_ROLE_NAME}}"
+          role-duration-seconds: 7200
+          role-session-name: ConfigureAWSCredSession
+
+      - name: Creating TEST RDS Cluster
+        run: |
+          LatestSnapShot=$(aws rds describe-db-cluster-snapshots --db-cluster-identifier test --query='reverse(sort_by(DBClusterSnapshots, &SnapshotCreateTime))[0] | DBClusterSnapshotIdentifier' --output text)
+          aws rds restore-db-cluster-from-snapshot --db-cluster-identifier ${{ github.event.inputs.Environment }}-db-refresh --snapshot-identifier $LatestSnapShot --vpc-security-group-ids "sg-6cb9b615" --engine aurora --engine-version 5.6.mysql_aurora.1.22.5 --db-subnet-group-name test-hyb-aurora-db-subnet-group --tags '[{"Key": "Name","Value": "db-refresh"},{"Key": "Owner","Value": "DevOps"}]'
+          status=unknown
+          while [[ "$status" != "available" ]]; do
+              sleep 60
+              status=$(aws rds describe-db-clusters --db-cluster-identifier ${{ github.event.inputs.Environment }}-db-refresh --query DBClusters[*].Status --output text)
+          done
+
+  creating-rds-instance:
+    name: Creating Test RDS Instance
+    runs-on: [ self-hosted, db-refresh ]
+    needs: [ set-up, checking-environment, creating-test-cluster ]
+    steps:
+      - name: Configure AWS credentials for TEST
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_BILLING_JENKINS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_BILLING_JENKINS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-to-assume: "arn:aws:iam::${{ secrets.AWS_TEST_ACCOUNT_NUMBER }}:role/${{secrets.AWS_PLATFORMS_ROLE_NAME}}"
+          role-duration-seconds: 7200
+          role-session-name: ConfigureAWSCredSession
+
+      - name: Creating TEST RDS Instance
+        run: |
+          aws rds create-db-instance --db-cluster-identifier ${{ github.event.inputs.Environment }}-db-refresh --db-instance-identifier ${{ github.event.inputs.Environment }}-db-refresh-1 --db-instance-class db.r5.large --engine aurora --engine-version 5.6.mysql_aurora.1.22.5 --tags '[{"Key": "Name","Value": "db-refresh-instance"},{"Key": "Owner","Value": "DevOps"}]'
+          aws rds wait db-instance-available --db-instance-identifier ${{ github.event.inputs.Environment }}-db-refresh-1
+
+  exporting-mysql-dump:
+    name: Exporting mysql dump from TEST Instance
+    runs-on: [ self-hosted, db-refresh ]
+    needs: [ set-up, checking-environment, creating-test-cluster, creating-rds-instance ]
+    steps:
+      - name: Configure AWS credentials for TEST
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_BILLING_JENKINS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_BILLING_JENKINS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-to-assume: "arn:aws:iam::${{ secrets.AWS_TEST_ACCOUNT_NUMBER }}:role/${{secrets.AWS_PLATFORMS_ROLE_NAME}}"
+          role-duration-seconds: 7200
+          role-session-name: ConfigureAWSCredSession
+
+      - name: Exporting mysql dump from TEST Instance
+        run: |
+          mysqldump  -h ${{ github.event.inputs.Environment }}-db-refresh.cluster-ro-ctm9wjkfghio.eu-west-1.rds.amazonaws.com -u ${{ secrets.DEV_HYBRIS_DB_BACKUP_USER }} -p${{ secrets.DEV_HYBRIS_DB_BACKUP_PASSWORD }} --ssl-mode=disabled --single-transaction --routines=0 --triggers=0 --no-tablespaces --column-statistics=0 hybris --compress > '${{ github.event.inputs.Environment }}'_hybris.sql
+
+  importing-mysql-dump:
+    name: Importing mysql dump to Environment Database
+    runs-on: [ self-hosted, db-refresh ]
+    needs: [ set-up, checking-environment, creating-test-cluster, creating-rds-instance, exporting-mysql-dump ]
+    steps:
+      - name: Configure AWS credentials for TEST
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_BILLING_JENKINS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_BILLING_JENKINS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-to-assume: "arn:aws:iam::${{ secrets.AWS_TEST_ACCOUNT_NUMBER }}:role/${{secrets.AWS_PLATFORMS_ROLE_NAME}}"
+          role-duration-seconds: 7200
+          role-session-name: ConfigureAWSCredSession
+
+      - name: Importing mysql dump to Environment Database
+        run: |
+          mysql -h hybris-development-instance-1.ctm9wjkfghio.eu-west-1.rds.amazonaws.com -u ${{ secrets.DEV_HYBRIS_DB_BACKUP_USER }} -p${{ secrets.DEV_HYBRIS_DB_BACKUP_PASSWORD }} --ssl-mode=disabled ${{ github.event.inputs.Environment }}_hybris < ${{ github.event.inputs.Environment }}_hybris.sql
+
+  remove-test-cluster:
+    name: Removing TEST RDS Cluster
+    runs-on: [ self-hosted, db-refresh ]
+    needs: [ set-up, checking-environment, creating-test-cluster, creating-rds-instance, exporting-mysql-dump, importing-mysql-dump ]
+    steps:
+      - name: Configure AWS credentials for TEST
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_BILLING_JENKINS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_BILLING_JENKINS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          role-to-assume: "arn:aws:iam::${{ secrets.AWS_TEST_ACCOUNT_NUMBER }}:role/${{secrets.AWS_PLATFORMS_ROLE_NAME}}"
+          role-duration-seconds: 7200
+          role-session-name: ConfigureAWSCredSession
+
+      - name: Removing TEST RDS Cluster
+        run: |
+          aws rds delete-db-instance --db-instance-identifier ${{ github.event.inputs.Environment }}-db-refresh-1 --skip-final-snapshot
+          aws rds wait db-instance-deleted --db-instance-identifier ${{ github.event.inputs.Environment }}-db-refresh-1
+          aws rds delete-db-cluster --db-cluster-identifier ${{ github.event.inputs.Environment }}-db-refresh --skip-final-snapshot
+

@@ -1,0 +1,107 @@
+name: create prd db snapshot and optimise
+on:
+  repository_dispatch:
+  workflow_dispatch:
+jobs:
+  set-up:
+    name: Set Up
+    runs-on: ubuntu-latest
+    outputs:
+      TODAY_DATE_TIME: ${{steps.getcurrentdatetime.outputs.TODAY_DATE_TIME}}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Get current date and time
+        id: getcurrentdatetime
+        run: echo "::set-output name=TODAY_DATE_TIME::$(date '+%Y-%m-%d-%H-%M')"
+
+  create-snapshot:
+    name: Snapshot Creation in Progress
+    runs-on: ubuntu-latest
+    needs: [ set-up ]
+    steps:
+      - name: Configure AWS credentials for PROD
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{secrets.AWS_SA_DB_SNAPSHOT_ACCESS_KEY}}
+          aws-secret-access-key: ${{secrets.AWS_SA_DB_SNAPSHOT_ACCESS_SECRET}}
+          aws-region: eu-west-1
+
+      - name: Snapshot Creation in Progress
+        run: |
+          echo ${{ needs.set-up.outputs.TODAY_DATE_TIME }}
+          aws rds create-db-cluster-snapshot --db-cluster-identifier aws-percona-aurora --db-cluster-snapshot-identifier aws-percona-aurora-${{ steps.outputs.TODAY_DATE_TIME }}
+          aws rds wait db-cluster-snapshot-available --db-cluster-identifier aws-percona-aurora --db-cluster-snapshot-identifier aws-percona-aurora-${{ steps.outputs.TODAY_DATE_TIME }}
+          echo "Snapshot creation complete!"
+
+  invoke-lambda-function:
+    name: Invoke mf_aurora_snapshot_sharing lambda function
+    runs-on: ubuntu-latest
+    needs: [ set-up, create-snapshot ]
+    steps:
+      - name: Configure AWS credentials for PROD
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{secrets.AWS_SA_DB_SNAPSHOT_ACCESS_KEY}}
+          aws-secret-access-key: ${{secrets.AWS_SA_DB_SNAPSHOT_ACCESS_SECRET}}
+          aws-region: eu-west-1
+
+      - name: Invoke mf_aurora_snapshot_sharing lambda function
+        shell: bash
+        env:
+          LAMBDA_PAYLOAD: ${{secrets.AWS_MFAURORA_LAMBDA_PAYLOAD}}
+        run: |
+          function_status=$(aws lambda get-function-configuration --function-name mf_aurora_snapshot_sharing --query 'LastUpdateStatus' --output text)
+          if [[ "$function_status" = "Successful" ]]; then
+            aws lambda invoke --function-name mf_aurora_snapshot_sharing RequestResponse --payload "$LAMBDA_PAYLOAD"
+            snapshot_status="unknown"
+            while [[ "$snapshot_status" != "available" ]]; do
+              echo "snapshot being prepared for optimization"
+              sleep 30
+              snapshot_status=$(aws rds describe-db-cluster-snapshots --db-cluster-snapshot-identifier db-optimize-aws-percona-aurora-${{ steps.getcurrentdatetime.outputs.TODAY_DATE_TIME }} --query 'DBClusterSnapshots[*].Status' --output text)
+            done
+            echo "Lambda function complete and snapshot available for optimization"
+          else
+            echo "Lambda function currently in use so cannot be invoked"
+          fi
+
+  execute-step-function:
+    name: Execute Step Function to Copy and Optimize snapshot to Test Environment
+    runs-on: ubuntu-latest
+    needs: [ set-up, create-snapshot, invoke-lambda-function ]
+    steps:
+      - name: Configure AWS credentials for TEST
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{secrets.AWS_BILLING_JENKINS_ACCESS_KEY}}
+          aws-secret-access-key: ${{secrets.AWS_BILLING_JENKINS_SECRET_ACCESS_KEY}}
+          aws-region: ${{secrets.AWS_DEFAULT_REGION}}
+          role-to-assume: "arn:aws:iam::${{secrets.AWS_TEST_ACCOUNT_NUMBER}}:role/${{secrets.AWS_PLATFORMS_ROLE_NAME}}"
+          role-duration-seconds: 3600
+          role-session-name: ReconfigureAWSCredSession
+
+      - name: Execute Step Function to Copy and Optimize snapshot to Test Environment
+        run: |
+          stepfunction_status=$(aws stepfunctions describe-state-machine --state-machine-arn arn:aws:states:eu-west-1:953612792372:stateMachine:DB-Optimise-Create-DB-Cluster-Step1 --query "status" --output json)
+          stepfunction_status=$(sed -e 's/^"//' -e 's/"$//' <<<"$stepfunction_status")
+          if [[ "$stepfunction_status" = "ACTIVE" ]]; then
+            aws stepfunctions start-execution --state-machine-arn arn:aws:states:eu-west-1:953612792372:stateMachine:DB-Optimise-Create-DB-Cluster-Step1 --input '${{secrets.AWS_STEP_FUNCTION_PAYLOAD}}'
+            TODAY_DATE=$(date '+%Y-%m-%d')
+            dbinstance_status="unknown"
+            while [[ "$dbinstance_status" != "available" ]]; do
+              echo "Test DB instance being prepared"
+              sleep 600
+              dbinstance_status=$(aws rds describe-db-instances --db-instance-identifier test-$TODAY_DATE-instance --query 'DBInstances[*].DBInstanceStatus' --output text)
+            done
+            echo "Test DB Instance created successfully, Now creating an optimised snapshot!"
+            echo "##########################################################################"
+            echo "##########################################################################"
+            echo "Please monitor slack channel #platform-auto-info for the following message: ***[TEST] db-optimize: Job finished***"
+            echo "This confirms a snapshot is available and ready to use for a db-refresh on your enviornment"
+            echo "##########################################################################"
+            echo "##########################################################################"
+          else
+            echo "step function currently in use, please check with the DevOps team!"
+          fi
+
