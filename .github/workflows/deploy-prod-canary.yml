@@ -1,0 +1,324 @@
+name: Deploy (PROD Canary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      imageName:
+        description: The image tag to deploy
+        required: true
+
+jobs:
+  set-up:
+    name: Set up
+    runs-on: ubuntu-latest
+    outputs:
+      startTime: ${{ steps.start-time.outputs.startTime }}
+
+    steps:
+      - name: Capture start time
+        id: start-time
+        run: |
+          startTime="$(date +%s)"
+          echo "$startTime"
+          echo "::set-output name=startTime::$startTime"
+
+  check-image-exists:
+    name: Check image exists
+    needs: set-up
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.HYBRIS_DEPLOY_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.HYBRIS_DEPLOY_SECRET }}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::953612792372:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - name: Check image exists
+        run: |
+          aws ecr get-login-password  --region eu-west-1 | docker login --username AWS --password-stdin 953612792372.dkr.ecr.eu-west-1.amazonaws.com
+
+          if [[ -z $(aws ecr describe-images --repository-name=hybris --query='imageDetails[*].imageTags' | jq -r 'flatten | .[]' | grep "^${{ github.event.inputs.imageName }}$") ]]; then
+            exit 1
+          fi
+
+  promote-image:
+    name: Promote image from test to prod
+    runs-on: ubuntu-latest
+    needs: [ set-up, check-image-exists ]
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.HYBRIS_DEPLOY_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.HYBRIS_DEPLOY_SECRET }}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::953612792372:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - name: Pull & tag Docker image
+        run: |
+          aws ecr get-login-password  --region eu-west-1 | docker login --username AWS --password-stdin 953612792372.dkr.ecr.eu-west-1.amazonaws.com
+
+          docker pull 953612792372.dkr.ecr.eu-west-1.amazonaws.com/hybris:"${{ github.event.inputs.imageName }}"
+          docker tag 953612792372.dkr.ecr.eu-west-1.amazonaws.com/hybris:"${{ github.event.inputs.imageName }}" 435918861460.dkr.ecr.eu-west-1.amazonaws.com/hybris:"${{ github.event.inputs.imageName }}"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.HYBRIS_DEPLOY_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.HYBRIS_DEPLOY_SECRET }}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::435918861460:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - name: Push Docker image
+        run: |
+          aws ecr get-login-password  --region eu-west-1 | docker login --username AWS --password-stdin 435918861460.dkr.ecr.eu-west-1.amazonaws.com
+
+          docker push 435918861460.dkr.ecr.eu-west-1.amazonaws.com/hybris:"${{ github.event.inputs.imageName }}"
+
+  deploy-config:
+    name: Generate & deploy config to EFS
+    runs-on: [ self-hosted, hybris-docker-runner-prod ]
+    needs: [ set-up, check-image-exists ]
+
+    steps:
+      - name: Checkout hybris-configuration
+        uses: actions/checkout@v2
+        with:
+          repository: matchesfashion/hybris-configuration
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.HYBRIS_DEPLOY_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.HYBRIS_DEPLOY_SECRET }}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::435918861460:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - uses: ./.github/actions/update-config-prod
+
+  extract-hybris:
+    name: Extract Hybris
+    runs-on: ubuntu-latest
+    needs: [ set-up, check-image-exists, promote-image ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.HYBRIS_DEPLOY_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.HYBRIS_DEPLOY_SECRET }}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::435918861460:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - name: Extract hybris from image
+        run: |
+          aws ecr get-login-password  --region eu-west-1 | docker login --username AWS --password-stdin 435918861460.dkr.ecr.eu-west-1.amazonaws.com
+
+          id=$(docker create 435918861460.dkr.ecr.eu-west-1.amazonaws.com/hybris:"${{ github.event.inputs.imageName }}")
+          docker cp $id:/opt/hybris - > hybris.tar
+          docker cp $id:/opt/import - >> hybris.tar
+          docker cp $id:/opt/export - >> hybris.tar
+          docker rm "$id"
+          bzip2 -9 hybris.tar
+
+      - name: Save hybris as artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: hybris.tar.bz2
+          path: hybris.tar.bz2
+          if-no-files-found: error
+
+  deploy-ec2:
+    name: Deploy EC2
+    runs-on: [ self-hosted, hybris-docker-runner-prod ]
+    needs: [ set-up, check-image-exists, deploy-config, extract-hybris ]
+    outputs:
+      deployDuration: ${{ steps.deploy-duration.outputs.duration }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Download hybris
+        uses: actions/download-artifact@v2
+        with:
+          name: hybris.tar.bz2
+
+      - name: Copy/stop/start hybris
+        run: |
+          set -euxo pipefail
+
+          rm -f $SSH_AUTH_SOCK
+          ssh-agent -a $SSH_AUTH_SOCK > /dev/null
+          ssh-add - <<< "${{ secrets.PROD_HYBRIS_SSH_KEY }}"
+
+          nodes=('app-9' 'cron-1')
+
+          for node in "${nodes[@]}"
+          do
+            remote="aws-prd-hyb-${node}.prd.aws.matchesfashion.com"
+
+            # Drain HAProxy traffic from node
+            curl -s -X GET -G https://haproxy-api.internal.prd.matchescloud.com/update -d name="${node}" -d status=drain -d backend=hybris
+            sleep 2m
+
+            # Remove existing hybris archive
+            ssh -t -o StrictHostKeyChecking=no centos@${remote} sudo rm -f /tmp/hybris.tar.bz2
+
+            # Copy hybris archive
+            scp -o StrictHostKeyChecking=no -r hybris.tar.bz2 centos@${remote}:/tmp
+
+            ssh -t -o StrictHostKeyChecking=no centos@${remote} /bin/bash <<EOF
+              set -euxo pipefail
+
+              # set hybris user as owner of the tar file
+              sudo chown hybris:users /tmp/hybris.tar.bz2
+
+              # login as hybris user
+              sudo su - hybris
+
+              export CATALINA_SECURITY_OPTS=-Djava.security.egd=file:/dev/./urandom \
+                CATALINA_MEMORY_OPTS=-Xms2G\ -Xmx2G \
+                HTTPS_PORT=8088 \
+                HTTP_PORT=8081 \
+                AJP_PORT=8009 \
+                KEYSTORE_LOCATION=/etc/ssl/certs/hybris/keystore \
+                KEYSTORE_PASSWORD=123456 \
+                PLATFORM_HOME=/opt/hybris/bin/platform \
+                WAIT_FOR="" \
+                JVM_ROUTE="" \
+                PATH="/opt/ytools:\${PATH}" \
+                HYBRIS_LOG_DIR=/var/log/hybris \
+                CATALINA_LOG_DIR=\${HYBRIS_LOG_DIR}/catalina \
+                ACCESS_LOG_DIR=\${HYBRIS_LOG_DIR}/tomcat \
+                ACCESS_LOG_SUFFIX=.log \
+                ACCESS_LOG_PATTERN=combined \
+                ACCESS_LOG_PREFIX=access. \
+                ERROR_SHOW_REPORT=false \
+                ERROR_SHOW_SERVER_INFO=false
+
+              set -euxo pipefail
+
+              # Cleanup old directories and create new directories if not exists
+              [[ -d /tmp/hybris ]] && rm -r /tmp/hybris
+              mkdir -p /tmp/hybris/{archive,backup}
+              mkdir -p /opt/hybris/{bin,config,data,log,roles,temp}
+
+              # Extract archive
+              bunzip2 -dc /tmp/hybris.tar.bz2 | tar -C /tmp/hybris/archive -x --ignore-zeros
+              rm /tmp/hybris.tar.bz2
+
+              # Stop Hybris
+              [[ -f /opt/hybris/bin/platform/hybrisserver.sh ]] && cd /opt/hybris/bin/platform && /opt/hybris/bin/platform/hybrisserver.sh stop
+              # Stop Hybris (legacy - stops Hybris which was deployed via Jenkins)
+              [[ -f /opt/hybris/current/hybris/bin/platform/tomcat/bin/wrapper.sh ]] && /opt/hybris/current/hybris/bin/platform/tomcat/bin/wrapper.sh stop
+
+              # Move current build to temp
+              mv /opt/hybris/{bin,config,data,log,roles,temp} /tmp/hybris/backup
+              # Move new build to /opt/hybris
+              mv /tmp/hybris/archive/hybris/{bin,config,data,log,roles,temp} /opt/hybris/
+
+              # Backup import/export and move new dirs to /opt 
+              # we can't move any directories in /opt because /opt is owned by root, so we need to exit the hybris user session
+              exit
+
+              set -euxo pipefail
+
+              # Create new directories if not exists
+              sudo mkdir -p /opt/{import,export}
+              # Make hybris user owner of new directories
+              sudo chown hybris:users /opt/{import,export}
+              # Move current import/export to temp
+              sudo mv /opt/{import,export} /tmp/hybris/backup
+              # Move new import/export to /opt
+              sudo mv /tmp/hybris/archive/{import,export} /opt
+
+              # login as hybris user again
+              sudo su - hybris
+
+              set -euxo pipefail
+
+              # Setup working directory
+              cd /opt/hybris/bin/platform
+
+              # Start Hybris as a background process
+              /opt/hybris/bin/platform/hybrisserver.sh start
+          EOF
+          done
+          rm -f $SSH_AUTH_SOCK
+        env:
+          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
+
+      - name: Set deploy duration output
+        id: deploy-duration
+        run: |
+          duration="$(($(date +%s)-${{ needs.set-up.outputs.startTime }}))"
+          echo "$duration"
+          echo "::set-output name=duration::$duration"
+
+  send-metrics:
+    name: Send Datadog metrics
+    if: always()
+    needs: [ set-up, deploy-ec2 ]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@v2
+        with:
+          repository: matchesfashion/composite-actions
+          token: ${{ secrets.GH_PAT }}
+          path: composite-actions
+
+      - name: Send Datadog success event
+        uses: ./composite-actions/send-datadog-event
+        if: success()
+        with:
+          title: Hybris_aws-prd_Deployment
+          text: Build ${{ github.event.inputs.imageName }} successfully deployed to aws-prd
+          host: aws-prd
+          tags: env:aws-prd,build:${{ github.event.inputs.imageName }},team:hybops
+          alert_type: success
+          dd_api_key: ${{ secrets.DATADOG_API_KEY }}
+
+      - name: Send Datadog failure event
+        if: failure()
+        uses: ./composite-actions/send-datadog-event
+        with:
+          title: Hybris_aws-prd_Deployment
+          text: Build ${{ github.event.inputs.imageName }} deploy to aws-prd failed
+          host: aws-prd
+          tags: env:aws-prd,build:${{ github.event.inputs.imageName }},team:hybops
+          alert_type: error
+          dd_api_key: ${{ secrets.DATADOG_API_KEY }}
+
+      - name: Send Datadog count metric
+        uses: ./composite-actions/send-datadog-metric
+        with:
+          metric_name: hybops.deploy.count
+          metric_value: 1
+          metric_type: count
+          tags: status:${{ job.status }}
+          dd_api_key: ${{ secrets.DATADOG_API_KEY }}
+
+      - name: Send Datadog deploy duration metric
+        uses: ./composite-actions/send-datadog-metric
+        with:
+          metric_name: hybops.deploy.duration
+          metric_value: ${{ needs.deploy-ec2.outputs.deployDuration }}
+          metric_type: gauge
+          tags: status:${{ job.status }}
+          dd_api_key: ${{ secrets.DATADOG_API_KEY }}

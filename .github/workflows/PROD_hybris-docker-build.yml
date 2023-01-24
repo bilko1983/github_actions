@@ -1,0 +1,218 @@
+name: PROD Hybris Docker Build
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: 'build number'
+        required: true
+      forceRebuild:
+        description: 'Whether to force an updated image to be built'
+        required: false
+        default: 'false'
+jobs:
+  fetch-local-properties:
+    runs-on: [self-hosted, hybris-docker-runner-prod]
+    steps:
+      - name: Save local props as artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: local-properties
+          path: /efs/config/aws-prd/ecs-app/local.properties
+          if-no-files-found: error
+
+  build:
+    runs-on: ubuntu-latest
+    needs: fetch-local-properties
+    steps:
+      - name: Set start time
+        run: echo "START_TIME=$(date +%s)" >> $GITHUB_ENV
+
+      - name: Set image name
+        run: echo "IMAGE_NAME=$(echo ${{ github.event.inputs.build }})" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v2
+
+      - name: Checkout Composite Actions
+        uses: actions/checkout@v2
+        with:
+          repository: matchesfashion/composite-actions
+          token: ${{ secrets.GH_PAT }}
+          path: .github/composite-actions
+
+      - name: Set up JDK 1.8
+        uses: actions/setup-java@v1
+        with:
+          java-version: 1.8
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{secrets.HYBRIS_DEPLOY_ACCESS_KEY}}
+          aws-secret-access-key: ${{secrets.HYBRIS_DEPLOY_SECRET}}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::435918861460:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - name: Check if image exists
+        id: check
+        run: |
+          aws ecr get-login-password  --region eu-west-1 | docker login --username AWS --password-stdin 435918861460.dkr.ecr.eu-west-1.amazonaws.com
+          if [ ${{ github.event.inputs.forceRebuild }} == "true" ]; then
+            echo "::set-output name=build-required::true"
+          else
+            if [ -z $(aws ecr describe-images --repository-name=hybris --query='imageDetails[*].imageTags' --output text | grep "$IMAGE_NAME") ]; then
+              echo "::set-output name=build-required::true"
+            else
+              echo "::set-output name=build-required::false"
+            fi
+          fi
+
+      - name: Re-configure AWS credentials
+        if: steps.check.outputs.build-required=='true'
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{secrets.AWS_TEST_JENKINS_ACCESS_KEY}}
+          aws-secret-access-key: ${{secrets.AWS_TEST_JENKINS_ACCESS_SECRET}}
+          aws-region: eu-west-1
+
+      - name: Download and unzip Artifacts
+        if: steps.check.outputs.build-required=='true'
+        run: |
+          S3_ROOT=s3://matches-ci-artifacts/jobs/master-ci/${{ github.event.inputs.build }}
+          mkdir hybris-artifacts
+          aws s3 cp --quiet $S3_ROOT/hybrisServer-Platform.zip .
+          aws s3 cp --quiet $S3_ROOT/hybrisServer-AllExtensions.zip .
+          aws s3 cp --quiet $S3_ROOT/hybrisServer-Configs.zip .
+          unzip -q hybrisServer-Platform.zip -d hybris-artifacts
+          unzip -q hybrisServer-AllExtensions.zip -d hybris-artifacts
+          unzip -q hybrisServer-Configs.zip -d hybris-artifacts
+
+          aws s3 cp --quiet s3://matches-ci-artifacts/hybrisServer-Licence.zip .
+          unzip -q hybrisServer-Licence.zip -d hybris-artifacts
+
+      - name: Download local-properties
+        uses: actions/download-artifact@v2
+        with:
+          name: local-properties
+
+      - name: Pull and build local.properties for compile time properties
+        if: steps.check.outputs.build-required=='true'
+        run: |
+          cp hybris-artifacts/hybris/config/common.properties hybris-artifacts/hybris/config/local.properties
+          echo >> hybris-artifacts/hybris/config/local.properties
+          cat hybris-artifacts/hybris/config/env/prd/local.properties >> hybris-artifacts/hybris/config/local.properties
+          echo >> hybris-artifacts/hybris/config/local.properties
+          cat local.properties >> hybris-artifacts/hybris/config/local.properties
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{secrets.HYBRIS_DEPLOY_ACCESS_KEY}}
+          aws-secret-access-key: ${{secrets.HYBRIS_DEPLOY_SECRET}}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::953612792372:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - name: Building Hybris Docker Image
+        if: steps.check.outputs.build-required=='true'
+        run: |
+          aws ecr get-login-password  --region eu-west-1 | docker login --username AWS --password-stdin 953612792372.dkr.ecr.eu-west-1.amazonaws.com
+          docker build \
+          --build-arg "CREATED=$(date)" \
+          --build-arg "IMAGE_NAME=$IMAGE_NAME" \
+          -t 435918861460.dkr.ecr.eu-west-1.amazonaws.com/hybris:$IMAGE_NAME \
+          -f hybris-server/Dockerfile \
+          hybris-artifacts/hybris
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{secrets.HYBRIS_DEPLOY_ACCESS_KEY}}
+          aws-secret-access-key: ${{secrets.HYBRIS_DEPLOY_SECRET}}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::435918861460:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - name: Push Hybris Docker Image to ECR
+        if: steps.check.outputs.build-required=='true'
+        run: |
+          aws ecr get-login-password  --region eu-west-1 | docker login --username AWS --password-stdin 435918861460.dkr.ecr.eu-west-1.amazonaws.com
+          docker push 435918861460.dkr.ecr.eu-west-1.amazonaws.com/hybris:$IMAGE_NAME
+
+      - name: Deploy infra
+        env:
+          TF_VAR_DD_APP_KEY: ${{secrets.DATADOG_APP_KEY}}
+          TF_VAR_DD_API_KEY: ${{secrets.DATADOG_API_KEY}}
+        run: |
+          brew install terragrunt -f \
+          && terragrunt run-all apply --terragrunt-non-interactive \
+          --terragrunt-working-dir terraform/accounts/prod/eu-west-1/aws-prd \
+          -var="image_name=$IMAGE_NAME" \
+          && terragrunt taint aws_ecs_task_definition.hybris_task_def \
+          --terragrunt-working-dir terraform/accounts/prod/eu-west-1/aws-prd/app \
+          && terragrunt taint datadog_dashboard_json.datadog_dashboard \
+          --terragrunt-working-dir terraform/accounts/prod/eu-west-1/aws-prd/datadog-dashboard \
+
+      - name: Send Datadog Success Event
+        uses: ./.github/composite-actions/send-datadog-event
+        if: success()
+        with:
+          title: Hybris_aws-prd_Deployment
+          text: Build $IMAGE_NAME successfully deployed to aws-prd
+          host: aws-prd
+          tags: env:aws-prd,build:$IMAGE_NAME,team:hybops
+          alert_type: success
+          dd_api_key: ${{secrets.DATADOG_API_KEY}}
+
+      - name: Send Slack Success Notification
+        if: success()
+        uses: ./.github/composite-actions/send-slack-message
+        with:
+          slack_token: ${{ secrets.SLACK_TOKEN }}
+          targetEnvironment: aws-prd
+          colour: "#00FF00"
+          lines: ":tada: *Deployment complete!* :tada:,I've just deployed build *$IMAGE_NAME* to *aws-prd*.,You can check out the aws-prd dashboard on Datadog :point_right: _<https://app.datadoghq.com/dashboard/lists?q=Hybris+Container+Dashboard+-+aws-prd|here>_."
+
+      - name: Send Datadog Failure Event
+        if: failure()
+        uses: ./.github/composite-actions/send-datadog-event
+        with:
+          title: Hybris_aws-prd_Deployment
+          text: Build $IMAGE_NAME deploy to aws-prd failed
+          host: aws-prd
+          tags: env:aws-prd,build:$IMAGE_NAME,team:hybops
+          alert_type: error
+          dd_api_key: ${{secrets.DATADOG_API_KEY}}
+
+      - name: Send Slack Failure Notification
+        if: failure()
+        uses: ./.github/composite-actions/send-slack-message
+        with:
+          slack_token: ${{ secrets.SLACK_TOKEN }}
+          targetEnvironment: aws-prd
+          colour: "#FF0000"
+          lines: ":skull: *Deployment failed* :skull:,Failure deploying build *$IMAGE_NAME* to *aws-prd*."
+
+      - name: Set Time Metric
+        run: echo "TIME_TAKEN=$(($(date +%s)-$START_TIME))" >> $GITHUB_ENV
+
+      - name: Send Datadog Count Metric
+        if: always()
+        uses: ./.github/composite-actions/send-datadog-metric
+        with:
+          metric_name: hybops.deploy.count
+          metric_value: 1
+          metric_type: count
+          tags: status:${{ job.status }},full_build:${{ steps.check.outputs.build-required=='true' }}
+          dd_api_key: ${{secrets.DATADOG_API_KEY}}
+
+      - name: Send Datadog Deploy Duration Metric
+        if: always()
+        uses: ./.github/composite-actions/send-datadog-metric
+        with:
+          metric_name: hybops.deploy.duration
+          metric_value: $TIME_TAKEN
+          metric_type: gauge
+          tags: status:${{ job.status }},full_build:${{ steps.check.outputs.build-required=='true' }}
+          dd_api_key: ${{secrets.DATADOG_API_KEY}}

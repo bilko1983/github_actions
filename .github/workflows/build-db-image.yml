@@ -1,0 +1,43 @@
+name: Build Hybris db image
+
+on:
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: 953612792372.dkr.ecr.eu-west-1.amazonaws.com/hybris/db:latest
+
+jobs:
+  build:
+    name: Build & push Docker image
+    runs-on: [ self-hosted, hybris-docker-runner ]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.HYBRIS_DEPLOY_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.HYBRIS_DEPLOY_SECRET }}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::953612792372:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - name: Get SQL DB dump
+        run: ./hybris-db/get-dump.sh
+
+      - name: Login to Docker
+        run: |
+          aws ecr get-login-password --region eu-west-1 | docker login --username AWS --password-stdin 953612792372.dkr.ecr.eu-west-1.amazonaws.com
+
+      - name: Building Hybris Docker db image
+        run: |
+          docker build \
+          -f hybris-db/Dockerfile \
+          -t ${{ env.IMAGE_NAME }} \
+          hybris-db
+
+      - name: Push Hybris Docker db image to ECR
+        run: |
+          docker push ${{ env.IMAGE_NAME }}

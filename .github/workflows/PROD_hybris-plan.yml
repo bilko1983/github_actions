@@ -1,0 +1,43 @@
+name: PROD TF Plan
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: 'build number'
+        required: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set image name
+        run: echo "IMAGE_NAME=$(echo ${{ github.event.inputs.build }})" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v2
+
+      - name: Checkout Composite Actions
+        uses: actions/checkout@v2
+        with:
+          repository: matchesfashion/composite-actions
+          token: ${{ secrets.GH_PAT }}
+          path: .github/composite-actions
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{secrets.HYBRIS_DEPLOY_ACCESS_KEY}}
+          aws-secret-access-key: ${{secrets.HYBRIS_DEPLOY_SECRET}}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::435918861460:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - name: Run TG Plan
+        env:
+          TF_VAR_DD_APP_KEY: ${{secrets.DATADOG_APP_KEY}}
+          TF_VAR_DD_API_KEY: ${{secrets.DATADOG_API_KEY}}
+        run: |
+          brew install terragrunt -f \
+          && terragrunt run-all plan --terragrunt-non-interactive \
+          --terragrunt-working-dir terraform/accounts/prod/eu-west-1/aws-prd \
+          --terragrunt-exclude-dir ./execution \
+          -var="image_name=$IMAGE_NAME" \

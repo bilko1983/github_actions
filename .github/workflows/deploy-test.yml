@@ -1,0 +1,325 @@
+name: Deploy (Test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      imageName:
+        description: The image tag to deploy
+        required: true
+      environment:
+        description: Name of the environment to deploy to
+        required: true
+
+concurrency: ${{ github.event.inputs.environment }}
+
+jobs:
+  set-up:
+    name: Set up
+    runs-on: ubuntu-latest
+    outputs:
+      startTime: ${{ steps.start-time.outputs.startTime }}
+      deployEc2: ${{ steps.deploy-ec2.outputs.deployEc2 }}
+
+    steps:
+      - name: Capture start time
+        id: start-time
+        run: |
+          startTime="$(date +%s)"
+          echo "$startTime"
+          echo "::set-output name=startTime::$startTime"
+
+      - name: Deploy EC2
+        id: deploy-ec2
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" == "integration" ]] || [[ "${{ github.event.inputs.environment }}" == "regression" ]]; then
+            deployEc2=true
+          else
+            deployEc2=false
+          fi
+
+          echo "$deployEc2"
+          echo "::set-output name=deployEc2::$deployEc2"
+
+  check-image-exists:
+    name: Check image exists
+    needs: set-up
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.HYBRIS_DEPLOY_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.HYBRIS_DEPLOY_SECRET }}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::953612792372:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - name: Check image exists
+        run: |
+          aws ecr get-login-password  --region eu-west-1 | docker login --username AWS --password-stdin 953612792372.dkr.ecr.eu-west-1.amazonaws.com
+
+          if [[ -z $(aws ecr describe-images --repository-name=hybris --query='imageDetails[*].imageTags' | jq -r 'flatten | .[]' | grep "^${{ github.event.inputs.imageName }}$") ]]; then
+            exit 1
+          fi
+
+  deploy-execution-resources:
+    name: Deploy Execution Resources
+    runs-on: ubuntu-latest
+    needs: check-image-exists
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_TEST_PACKER_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_TEST_PACKER_ACCESS_SECRET }}
+          aws-region: eu-west-1
+
+      - name: Deploy infra
+        env:
+          TF_VAR_DD_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+          TF_VAR_DD_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+        run: |
+          set -euxo pipefail
+
+          brew install terragrunt -f
+
+          workingDir="terraform/accounts/test/eu-west-1/${{ github.event.inputs.environment }}"
+
+          terragrunt apply -auto-approve --terragrunt-non-interactive \
+            --terragrunt-working-dir "$workingDir"/execution
+
+  deploy-config:
+    name: Generate & deploy config to EFS
+    runs-on: [ self-hosted, hybris-docker-runner ]
+    needs: deploy-execution-resources
+
+    steps:
+      - name: Checkout hybris-configuration
+        uses: actions/checkout@v2
+        with:
+          repository: matchesfashion/hybris-configuration
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.HYBRIS_DEPLOY_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.HYBRIS_DEPLOY_SECRET }}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::953612792372:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - uses: ./.github/actions/update-config
+        with:
+          targetEnvironment: ${{ github.event.inputs.environment }}
+
+  deploy-ecs:
+    name: Deploy ECS
+    runs-on: ubuntu-latest
+    needs:
+      - check-image-exists
+      - deploy-config
+    outputs:
+      deployDuration: ${{ steps.deploy-duration.outputs.duration }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_TEST_PACKER_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_TEST_PACKER_ACCESS_SECRET }}
+          aws-region: eu-west-1
+
+      - name: Deploy infra
+        env:
+          TF_VAR_DD_APP_KEY: ${{ secrets.DATADOG_APP_KEY }}
+          TF_VAR_DD_API_KEY: ${{ secrets.DATADOG_API_KEY }}
+        run: |
+          set -euxo pipefail
+
+          brew install terragrunt -f
+
+          workingDir="terraform/accounts/test/eu-west-1/${{ github.event.inputs.environment }}"
+
+          terragrunt run-all apply --terragrunt-non-interactive \
+            --terragrunt-working-dir "$workingDir" \
+            --terragrunt-exclude-dir ./execution \
+            -var="image_name=${{ github.event.inputs.imageName }}"
+
+          for dir in "$workingDir"/*; do
+            if [[ -f $dir/terragrunt.hcl ]]; then
+              if [[ "$(basename "$dir")" == 'datadog-dashboard' ]]; then
+                terragrunt taint datadog_dashboard_json.datadog_dashboard \
+                --terragrunt-working-dir "$dir"
+              elif [[ "$(basename "$dir")" != 'execution' ]]; then
+                terragrunt taint aws_ecs_task_definition.hybris_task_def \
+                  --terragrunt-working-dir "$dir"
+              fi
+            fi
+          done
+
+      - name: Set deploy duration output
+        id: deploy-duration
+        run: |
+          duration="$(($(date +%s)-${{ needs.set-up.outputs.startTime }}))"
+          echo "$duration"
+          echo "::set-output name=duration::$duration"
+
+  extract-hybris:
+    name: Extract Hybris
+    runs-on: ubuntu-latest
+    needs:
+      - set-up
+      - check-image-exists
+    if: ${{ needs.set-up.outputs.deployEc2 == 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.HYBRIS_DEPLOY_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.HYBRIS_DEPLOY_SECRET }}
+          aws-region: eu-west-1
+          role-to-assume: arn:aws:iam::953612792372:role/hybris-containers-deployment
+          role-duration-seconds: 1200
+
+      - name: Extract hybris from image
+        run: |
+          aws ecr get-login-password  --region eu-west-1 | docker login --username AWS --password-stdin 953612792372.dkr.ecr.eu-west-1.amazonaws.com
+
+          id=$(docker create 953612792372.dkr.ecr.eu-west-1.amazonaws.com/hybris:"${{ github.event.inputs.imageName }}")
+          docker cp $id:/opt/hybris - > hybris.tar
+          docker cp $id:/opt/import - >> hybris.tar
+          docker cp $id:/opt/export - >> hybris.tar
+          docker rm "$id"
+          bzip2 -9 hybris.tar
+
+      - name: Save hybris as artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: hybris.tar.bz2
+          path: hybris.tar.bz2
+          if-no-files-found: error
+
+  deploy-ec2:
+    name: Deploy EC2
+    runs-on: [ self-hosted, hybris-docker-runner ]
+    needs:
+      - set-up
+      - deploy-config
+      - extract-hybris
+    if: ${{ needs.set-up.outputs.deployEc2 == 'true' }}
+    outputs:
+      deployDuration: ${{ steps.deploy-duration.outputs.duration }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+
+      - name: Download hybris
+        uses: actions/download-artifact@v2
+        with:
+          name: hybris.tar.bz2
+
+      - name: Copy/stop/start hybris
+        run: |
+          set -euxo pipefail
+
+          rm -f $SSH_AUTH_SOCK
+          ssh-agent -a $SSH_AUTH_SOCK > /dev/null
+          ssh-add - <<< "${{ secrets.HYBRIS_SSH_KEY }}"
+
+          app="${{ github.event.inputs.environment }}-app-1.matcheslocal.com"
+          cron="${{ github.event.inputs.environment }}-cron-1.matcheslocal.com"
+          man="${{ github.event.inputs.environment }}-man-1.matcheslocal.com"
+          parallel sh .github/scripts/deploy-ec2.sh ::: $app $cron $man
+
+          rm -f $SSH_AUTH_SOCK
+        env:
+          SSH_AUTH_SOCK: /tmp/ssh_agent.sock
+
+      - name: Set deploy duration output
+        id: deploy-duration
+        run: |
+          duration="$(($(date +%s)-${{ needs.set-up.outputs.startTime }}))"
+          echo "$duration"
+          echo "::set-output name=duration::$duration"
+
+  send-metrics:
+    name: Send Datadog metrics
+    if: always()
+    needs:
+      - set-up
+      - deploy-ecs
+      - deploy-ec2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@v2
+        with:
+          repository: matchesfashion/composite-actions
+          token: ${{ secrets.GH_PAT }}
+          path: composite-actions
+
+      - name: Send Datadog success event
+        uses: ./composite-actions/send-datadog-event
+        if: success()
+        with:
+          title: Hybris_${{ github.event.inputs.environment }}_Deployment
+          text: Build ${{ github.event.inputs.imageName }} successfully deployed to ${{ github.event.inputs.environment }}
+          host: ${{ github.event.inputs.environment }}
+          tags: env:${{ github.event.inputs.environment }},build:${{ github.event.inputs.imageName }},team:hybops
+          alert_type: success
+          dd_api_key: ${{ secrets.DATADOG_API_KEY }}
+
+      - name: Send Datadog failure event
+        if: failure()
+        uses: ./composite-actions/send-datadog-event
+        with:
+          title: Hybris_${{ github.event.inputs.environment }}_Deployment
+          text: Build ${{ github.event.inputs.imageName }} deploy to ${{ github.event.inputs.environment }} failed
+          host: ${{ github.event.inputs.environment }}
+          tags: env:${{ github.event.inputs.environment }},build:${{ github.event.inputs.imageName }},team:hybops
+          alert_type: error
+          dd_api_key: ${{ secrets.DATADOG_API_KEY }}
+
+      - name: Send Datadog count metric
+        uses: ./composite-actions/send-datadog-metric
+        with:
+          metric_name: hybops.deploy.count
+          metric_value: 1
+          metric_type: count
+          tags: status:${{ job.status }}
+          dd_api_key: ${{ secrets.DATADOG_API_KEY }}
+
+      - name: Calculate deploy duration
+        id: deploy-duration
+        run: |
+          if [[ ${{ needs.set-up.outputs.deployEc2 }} == 'true' ]]; then
+            duration="$((${{ needs.deploy-ecs.outputs.deployDuration }}+${{ needs.deploy-ec2.outputs.deployDuration }}))"
+          else
+            duration="${{ needs.deploy-ecs.outputs.deployDuration }}"
+          fi
+          echo "$duration"
+          echo "::set-output name=deployDuration::$duration"
+
+      - name: Send Datadog deploy duration metric
+        uses: ./composite-actions/send-datadog-metric
+        with:
+          metric_name: hybops.deploy.duration
+          metric_value: ${{ steps.deploy-duration.outputs.deployDuration }}
+          metric_type: gauge
+          tags: status:${{ job.status }}
+          dd_api_key: ${{ secrets.DATADOG_API_KEY }}
